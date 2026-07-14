@@ -423,6 +423,11 @@ public class WebServer {
             return;
         }
 
+        if (path.equals("/employee-delete")) {
+            deleteEmployee(exchange);
+            return;
+        }
+
         if (path.equals("/positions")) {
             send(exchange, renderLayout("ポジション管理", renderPositions(exchange)));
             return;
@@ -692,6 +697,13 @@ public class WebServer {
         html.append("<button class='submit-button' type='submit'>保存する</button>");
         html.append("</div>");
         html.append("</form>");
+        if (employeeId != null) {
+            html.append("<form class='delete-employee-form' method='post' action='/employee-delete' ")
+                .append("onsubmit=\"return confirm('この従業員を完全に削除しますか？\\n希望シフト・勤務シフト・ポジション情報も削除され、元に戻せません。');\">");
+            html.append("<input type='hidden' name='employee_id' value='").append(employeeId).append("'>");
+            html.append("<button class='danger-button' type='submit'>この従業員を完全削除</button>");
+            html.append("</form>");
+        }
         return html.toString();
     }
 
@@ -713,6 +725,8 @@ public class WebServer {
             html.append("<p class='success'>従業員を登録しました。</p>");
         } else if ("updated".equals(result)) {
             html.append("<p class='success'>従業員情報・昇格情報を更新しました。</p>");
+        } else if ("deleted".equals(result)) {
+            html.append("<p class='success'>従業員と関連データを削除しました。</p>");
         } else if ("invalid".equals(result)) {
             html.append("<p class='error'>入力内容を確認してください。</p>");
         } else if ("not-found".equals(result)) {
@@ -803,6 +817,60 @@ public class WebServer {
                     redirect(exchange, "/employees?result=invalid");
                     return;
                 }
+                throw e;
+            } finally {
+                connection.setAutoCommit(true);
+            }
+        }
+    }
+
+    private static void deleteEmployee(HttpExchange exchange) throws Exception {
+        if (!exchange.getRequestMethod().equalsIgnoreCase("POST")) {
+            redirect(exchange, "/employees?result=invalid");
+            return;
+        }
+
+        String employeeIdText = getParams(exchange).getOrDefault("employee_id", "").trim();
+        int employeeId;
+        try {
+            employeeId = Integer.parseInt(employeeIdText);
+        } catch (NumberFormatException e) {
+            redirect(exchange, "/employees?result=not-found");
+            return;
+        }
+
+        String[] relatedDeleteSqls = {
+            "DELETE FROM work_shift WHERE employee_id = ?",
+            "DELETE FROM request_shift WHERE employee_id = ?",
+            "DELETE FROM employee_day_off WHERE employee_id = ?",
+            "DELETE FROM employee_position WHERE employee_id = ?"
+        };
+
+        try (Connection connection = DBConnection.getConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                for (String sql : relatedDeleteSqls) {
+                    try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                        statement.setInt(1, employeeId);
+                        statement.executeUpdate();
+                    }
+                }
+
+                try (PreparedStatement statement = connection.prepareStatement(
+                    "DELETE FROM employees WHERE employee_id = ?"
+                )) {
+                    statement.setInt(1, employeeId);
+                    if (statement.executeUpdate() == 0) {
+                        connection.rollback();
+                        redirect(exchange, "/employees?result=not-found");
+                        return;
+                    }
+                }
+
+                connection.commit();
+                redirect(exchange, "/employees?result=deleted");
+            } catch (Exception e) {
+                connection.rollback();
                 throw e;
             } finally {
                 connection.setAutoCommit(true);
@@ -2173,6 +2241,7 @@ public class WebServer {
             + ".level-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-top:18px;}"
             + ".form-actions{display:flex;justify-content:center;align-items:center;gap:16px;padding:0 0 24px;}"
             + ".cancel-link{display:inline-flex;align-items:center;height:52px;padding:0 24px;color:#52606d;text-decoration:none;font-weight:700;}"
+            + ".delete-employee-form{display:flex;justify-content:center;border-top:1px solid #d5e0ea;padding:24px 0 8px;margin-top:8px;}"
             + ".required-table-wrap{overflow:auto;max-height:70vh;border:1px solid #d5e0ea;background:#fff;}"
             + ".required-table{margin:0;border:0;min-width:620px;}.required-table th{position:sticky;top:0;z-index:2;}"
             + ".required-table th:first-child{left:0;z-index:3;min-width:90px;}.required-table td{text-align:center;}"

@@ -18,3 +18,7 @@ javac
 # Logs and crash reports
 *.log
 hs_err_pid*
+
+# Local database exports
+*.sql
+*.dump
