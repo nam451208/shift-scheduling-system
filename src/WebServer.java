@@ -46,6 +46,7 @@ public class WebServer {
     public static void main(String[] args) throws Exception {
         validateLoginSettings();
         initializeLoginUsers();
+        initializePerformanceIndexes();
         HttpServer server = HttpServer.create(new InetSocketAddress(PORT), 0);
 
         server.createContext("/", exchange -> {
@@ -151,6 +152,62 @@ public class WebServer {
         }
 
         LOGIN_USERS.clear();
+    }
+
+    private static void initializePerformanceIndexes() throws Exception {
+        String[][] indexes = {
+            {
+                "request_shift", "idx_request_shift_date_status_times",
+                "work_date, is_submitted, start_time, end_time, employee_id"
+            },
+            {
+                "request_shift", "idx_request_shift_employee_period",
+                "employee_id, work_date, is_submitted"
+            },
+            {
+                "work_shift", "idx_work_shift_employee_date_times",
+                "employee_id, work_date, start_time, end_time, position_id"
+            },
+            {
+                "work_shift", "idx_work_shift_date_position_time",
+                "work_date, position_id, start_time, employee_id"
+            },
+            {
+                "required_staff", "idx_required_staff_type_time_position",
+                "day_type, time_slot, position_id"
+            },
+            {
+                "employee_day_off", "idx_day_off_employee_date_times",
+                "employee_id, off_date, start_time, end_time"
+            }
+        };
+
+        String existsSql =
+            "SELECT COUNT(*) AS index_count FROM information_schema.statistics " +
+            "WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?";
+
+        try (Connection connection = DBConnection.getConnection()) {
+            for (String[] index : indexes) {
+                boolean exists;
+                try (PreparedStatement statement = connection.prepareStatement(existsSql)) {
+                    statement.setString(1, index[0]);
+                    statement.setString(2, index[1]);
+                    try (ResultSet rs = statement.executeQuery()) {
+                        rs.next();
+                        exists = rs.getInt("index_count") > 0;
+                    }
+                }
+
+                if (!exists) {
+                    String createSql = "CREATE INDEX " + index[1] + " ON "
+                        + index[0] + " (" + index[2] + ")";
+                    try (PreparedStatement statement = connection.prepareStatement(createSql)) {
+                        statement.executeUpdate();
+                    }
+                    System.out.println("Created database index: " + index[1]);
+                }
+            }
+        }
     }
 
     private static void handleLogin(HttpExchange exchange) throws Exception {
