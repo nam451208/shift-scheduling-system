@@ -125,11 +125,18 @@ public class WebServer {
             "password_hash VARCHAR(500) NOT NULL, " +
             "updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP " +
             "ON UPDATE CURRENT_TIMESTAMP)";
+        String createSettingsSql =
+            "CREATE TABLE IF NOT EXISTS app_settings (" +
+            "setting_key VARCHAR(100) PRIMARY KEY, " +
+            "setting_value VARCHAR(500) NOT NULL)";
         String insertSql =
             "INSERT IGNORE INTO app_users (username, password_hash) VALUES (?, ?)";
 
         try (Connection connection = DBConnection.getConnection()) {
             try (PreparedStatement statement = connection.prepareStatement(createSql)) {
+                statement.executeUpdate();
+            }
+            try (PreparedStatement statement = connection.prepareStatement(createSettingsSql)) {
                 statement.executeUpdate();
             }
 
@@ -369,7 +376,12 @@ public class WebServer {
         }
 
         if (path.equals("/generate")) {
-            send(exchange, renderLayout("シフト自動生成", renderGenerate()));
+            send(exchange, renderLayout("シフト自動生成", renderGenerate(exchange)));
+            return;
+        }
+
+        if (path.equals("/generate-run")) {
+            runGenerate(exchange);
             return;
         }
 
@@ -533,7 +545,7 @@ public class WebServer {
         html.append("<div class='home-grid'>");
         html.append(homeCard("シフト自動生成", "希望シフトと条件からシフトを作成します。", "/generate"));
         html.append(homeCard("シフト結果", "日別のシフトを横長の表で確認できます。", "/shifts"));
-        html.append(homeCard("希望入力", "従業員ごとに2週間分の希望をまとめて登録できます。", "/request-form"));
+        html.append(homeCard("希望入力", "従業員ごとに指定期間の希望をまとめて登録できます。", "/request-form"));
         html.append(homeCard("不足チェック", "本当に不足している時間だけ確認できます。", "/shortage"));
         html.append("</div>");
         html.append("</section>");
@@ -548,16 +560,58 @@ public class WebServer {
             + "</a>";
     }
 
-    private static String renderGenerate() {
-        try {
-            ShiftGenerator.main(null);
-            return "<section class='panel'><h1>シフト自動生成</h1><p class='success'>シフト自動生成が完了しました。</p>"
-                + "<p><a class='primary-link' href='/shifts'>シフト結果を見る</a></p></section>";
-        } catch (Exception e) {
-            return "<section class='panel'><h1>シフト自動生成</h1>"
-                + "<p class='error'>シフト自動生成中にエラーが発生しました。</p>"
-                + "<pre>" + escape(stackTraceToText(e)) + "</pre></section>";
+    private static String renderGenerate(HttpExchange exchange) throws Exception {
+        DateRange period = getConfiguredPeriod();
+        String result = getParams(exchange).get("result");
+        StringBuilder html = new StringBuilder();
+
+        html.append("<section class='panel generate-panel'>");
+        html.append("<h1>シフト自動生成</h1>");
+        if ("success".equals(result)) {
+            html.append("<p class='success'>指定した期間のシフト自動生成が完了しました。</p>");
+            html.append("<p><a class='primary-link' href='/shifts'>シフト結果を見る</a></p>");
+        } else if ("invalid".equals(result)) {
+            html.append("<p class='error'>開始日と終了日を確認してください。期間は最大62日です。</p>");
         }
+
+        html.append("<p>希望入力とシフト生成に使用する期間を指定します。</p>");
+        html.append("<form class='generate-form' method='post' action='/generate-run' ")
+            .append("onsubmit=\"return confirm('指定期間の作成済みシフトを削除して、再生成しますか？');\">");
+        html.append("<label>開始日<input type='date' name='start_date' required value='")
+            .append(period.start).append("'></label>");
+        html.append("<label>終了日<input type='date' name='end_date' required value='")
+            .append(period.end).append("'></label>");
+        html.append("<button class='submit-button' type='submit'>この期間で生成する</button>");
+        html.append("</form></section>");
+        return html.toString();
+    }
+
+    private static void runGenerate(HttpExchange exchange) throws Exception {
+        if (!exchange.getRequestMethod().equalsIgnoreCase("POST")) {
+            redirect(exchange, "/generate?result=invalid");
+            return;
+        }
+
+        Map<String, String> params = getParams(exchange);
+        LocalDate start;
+        LocalDate end;
+        try {
+            start = LocalDate.parse(params.getOrDefault("start_date", ""));
+            end = LocalDate.parse(params.getOrDefault("end_date", ""));
+        } catch (Exception e) {
+            redirect(exchange, "/generate?result=invalid");
+            return;
+        }
+
+        long dayCount = Duration.between(start.atStartOfDay(), end.plusDays(1).atStartOfDay()).toDays();
+        if (end.isBefore(start) || dayCount < 1 || dayCount > 62) {
+            redirect(exchange, "/generate?result=invalid");
+            return;
+        }
+
+        saveConfiguredPeriod(start, end);
+        ShiftGenerator.generateShift(start, end);
+        redirect(exchange, "/generate?result=success");
     }
 
     private static String renderEmployees(HttpExchange exchange) throws Exception {
@@ -1381,10 +1435,13 @@ public class WebServer {
     private static String renderRequestForm(HttpExchange exchange) throws Exception {
         Map<String, String> params = getParams(exchange);
 
-        LocalDate periodStart = getDefaultStartDate();
-        if (params.containsKey("period_start") && !params.get("period_start").isBlank()) {
-            periodStart = LocalDate.parse(params.get("period_start"));
-        }
+        DateRange period = getConfiguredPeriod();
+        LocalDate periodStart = period.start;
+        LocalDate periodEnd = period.end;
+        int periodDays = (int) Duration.between(
+            periodStart.atStartOfDay(),
+            periodEnd.plusDays(1).atStartOfDay()
+        ).toDays();
 
         int selectedEmployeeId = 0;
         if (params.containsKey("employee_id") && !params.get("employee_id").isBlank()) {
@@ -1398,7 +1455,7 @@ public class WebServer {
         }
 
         Map<LocalDate, RequestItem> existingRequests =
-            getExistingRequests(selectedEmployeeId, periodStart, periodStart.plusDays(14));
+            getExistingRequests(selectedEmployeeId, periodStart, periodEnd);
 
         StringBuilder html = new StringBuilder();
 
@@ -1417,26 +1474,25 @@ public class WebServer {
         }
 
         html.append("</select>");
-        html.append("<label>開始日</label>");
-        html.append("<input type='date' name='period_start' value='").append(periodStart).append("'>");
         html.append("<button type='submit'>表示</button>");
         html.append("</form>");
 
         html.append("<form method='post' action='/request-save' class='request-submit-form'>");
         html.append("<input type='hidden' name='employee_id' value='").append(selectedEmployeeId).append("'>");
         html.append("<input type='hidden' name='period_start' value='").append(periodStart).append("'>");
+        html.append("<input type='hidden' name='period_end' value='").append(periodEnd).append("'>");
 
         html.append("<div class='request-top'>");
         html.append("<div>");
-        html.append("<strong>").append(periodStart).append("〜").append(periodStart.plusDays(14)).append("</strong>");
-        html.append("<span>2週間分の希望をまとめて登録</span>");
+        html.append("<strong>").append(periodStart).append("〜").append(periodEnd).append("</strong>");
+        html.append("<span>指定期間の希望をまとめて登録</span>");
         html.append("</div>");
         html.append("<div class='total-box'>合計 <span id='totalHours'>0:00</span></div>");
         html.append("</div>");
 
         html.append("<div class='request-days'>");
 
-        for (int i = 0; i < 15; i++) {
+        for (int i = 0; i < periodDays; i++) {
             LocalDate date = periodStart.plusDays(i);
             RequestItem request = existingRequests.get(date);
 
@@ -1512,7 +1568,7 @@ public class WebServer {
         html.append("function toMinutes(v){var p=v.split(':');return Number(p[0])*60+Number(p[1]);}");
         html.append("function updateTotal(){");
         html.append("var total=0;");
-        html.append("for(var i=0;i<15;i++){");
+        html.append("for(var i=0;i<").append(periodDays).append(";i++){");
         html.append("var mode=document.querySelector('input[name=\"mode_'+i+'\"]:checked');");
         html.append("if(!mode){continue;}");
         html.append("if(mode.value==='all'){total+=720;}");
@@ -1538,7 +1594,16 @@ public class WebServer {
 
         int employeeId = Integer.parseInt(params.get("employee_id"));
         LocalDate periodStart = LocalDate.parse(params.get("period_start"));
-        LocalDate periodEnd = periodStart.plusDays(14);
+        LocalDate periodEnd = LocalDate.parse(params.get("period_end"));
+        int periodDays = (int) Duration.between(
+            periodStart.atStartOfDay(),
+            periodEnd.plusDays(1).atStartOfDay()
+        ).toDays();
+
+        if (periodEnd.isBefore(periodStart) || periodDays < 1 || periodDays > 62) {
+            redirect(exchange, "/request-form");
+            return;
+        }
 
         try (Connection connection = DBConnection.getConnection()) {
             connection.setAutoCommit(false);
@@ -1561,7 +1626,7 @@ public class WebServer {
                 "VALUES (?, ?, ?, ?, true)";
 
             try (PreparedStatement statement = connection.prepareStatement(insertSql)) {
-                for (int i = 0; i < 15; i++) {
+                for (int i = 0; i < periodDays; i++) {
                     LocalDate date = periodStart.plusDays(i);
                     String mode = params.getOrDefault("mode_" + i, "off");
 
@@ -2110,8 +2175,9 @@ public class WebServer {
     private static List<LocalDate> getTargetDates() throws Exception {
         List<LocalDate> dates = new ArrayList<>();
 
-        LocalDate startDate = getDefaultStartDate();
-        LocalDate endDate = startDate.plusDays(14);
+        DateRange period = getConfiguredPeriod();
+        LocalDate startDate = period.start;
+        LocalDate endDate = period.end;
 
         for (LocalDate date = startDate; !date.isAfter(endDate); date = date.plusDays(1)) {
             dates.add(date);
@@ -2121,6 +2187,61 @@ public class WebServer {
     }
 
     private static LocalDate getDefaultStartDate() throws Exception {
+        return getConfiguredPeriod().start;
+    }
+
+    private static DateRange getConfiguredPeriod() throws Exception {
+        LocalDate fallbackStart = getRequestStartDate();
+        LocalDate start = fallbackStart;
+        LocalDate end = fallbackStart.plusDays(14);
+        String sql =
+            "SELECT setting_key, setting_value FROM app_settings " +
+            "WHERE setting_key IN ('shift_start_date', 'shift_end_date')";
+
+        try (
+            Connection connection = DBConnection.getConnection();
+            PreparedStatement statement = connection.prepareStatement(sql);
+            ResultSet rs = statement.executeQuery()
+        ) {
+            while (rs.next()) {
+                try {
+                    if ("shift_start_date".equals(rs.getString("setting_key"))) {
+                        start = LocalDate.parse(rs.getString("setting_value"));
+                    } else if ("shift_end_date".equals(rs.getString("setting_key"))) {
+                        end = LocalDate.parse(rs.getString("setting_value"));
+                    }
+                } catch (Exception ignored) {
+                    // 壊れた設定値は既定期間に戻す
+                }
+            }
+        }
+
+        if (end.isBefore(start)) {
+            end = start.plusDays(14);
+        }
+        return new DateRange(start, end);
+    }
+
+    private static void saveConfiguredPeriod(LocalDate start, LocalDate end) throws Exception {
+        String sql =
+            "INSERT INTO app_settings (setting_key, setting_value) VALUES (?, ?) " +
+            "ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)";
+
+        try (
+            Connection connection = DBConnection.getConnection();
+            PreparedStatement statement = connection.prepareStatement(sql)
+        ) {
+            statement.setString(1, "shift_start_date");
+            statement.setString(2, start.toString());
+            statement.addBatch();
+            statement.setString(1, "shift_end_date");
+            statement.setString(2, end.toString());
+            statement.addBatch();
+            statement.executeBatch();
+        }
+    }
+
+    private static LocalDate getRequestStartDate() throws Exception {
         String sql = "SELECT MIN(work_date) AS start_date FROM request_shift";
 
         try (
@@ -2275,6 +2396,11 @@ public class WebServer {
             + ".password-form{display:flex;flex-direction:column;gap:18px;}"
             + ".password-form label{display:flex;flex-direction:column;gap:8px;font-weight:700;}"
             + ".password-form input{height:46px;padding:0 12px;border:1px solid #cbd6e2;border-radius:6px;font-size:16px;}"
+            + ".generate-panel{max-width:680px;margin-left:auto;margin-right:auto;}"
+            + ".generate-form{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:end;}"
+            + ".generate-form label{display:flex;flex-direction:column;gap:8px;font-weight:700;}"
+            + ".generate-form input{height:46px;padding:0 12px;border:1px solid #cbd6e2;border-radius:6px;font-size:16px;}"
+            + ".generate-form .submit-button{grid-column:1/-1;justify-self:center;}"
             + "pre{white-space:pre-wrap;background:#0f172a;color:#e5e7eb;padding:16px;border-radius:6px;overflow:auto;}"
             + "@media(max-width:600px){"
             + "*,*::before,*::after{box-sizing:border-box;}"
@@ -2295,6 +2421,7 @@ public class WebServer {
             + ".admin-form,.inline-form{display:grid;grid-template-columns:1fr;align-items:stretch;}"
             + ".admin-form input,.inline-form input,.admin-form button,.inline-form button{width:100%;min-width:0;font-size:16px;}"
             + ".form-grid,.level-grid{grid-template-columns:1fr;}"
+            + ".generate-form{grid-template-columns:1fr;}.generate-form .submit-button{grid-column:1;width:100%;}"
             + ".form-grid input,.form-grid select,.level-grid input{width:100%;font-size:16px;}"
             + ".form-actions{display:grid;grid-template-columns:1fr;gap:8px;}.cancel-link{justify-content:center;order:2;}"
             + ".submit-button{width:100%;min-width:0;font-size:18px;}"
@@ -2452,6 +2579,16 @@ public class WebServer {
         Session(String username, Instant expiresAt) {
             this.username = username;
             this.expiresAt = expiresAt;
+        }
+    }
+
+    private static class DateRange {
+        LocalDate start;
+        LocalDate end;
+
+        DateRange(LocalDate start, LocalDate end) {
+            this.start = start;
+            this.end = end;
         }
     }
 

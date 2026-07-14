@@ -39,7 +39,14 @@ public class ShiftGenerator {
             return;
         }
 
-        LocalDate endDate = startDate.plusDays(14);
+        generateShift(startDate, startDate.plusDays(14));
+    }
+
+    public static void generateShift(LocalDate startDate, LocalDate endDate) throws Exception {
+
+        if (startDate == null || endDate == null || endDate.isBefore(startDate)) {
+            throw new IllegalArgumentException("シフト期間が正しくありません。");
+        }
 
         deleteOldShift(startDate, endDate);
 
