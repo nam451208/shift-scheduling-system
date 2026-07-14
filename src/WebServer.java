@@ -25,6 +25,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
 
 import javax.crypto.SecretKeyFactory;
 import javax.crypto.spec.PBEKeySpec;
@@ -69,7 +70,8 @@ public class WebServer {
             }
         });
 
-        server.setExecutor(null);
+        // シフト生成中も、Renderのヘルスチェックや別の画面表示に応答できるようにする。
+        server.setExecutor(Executors.newFixedThreadPool(8));
         server.start();
 
         System.out.println("WebServer started.");
