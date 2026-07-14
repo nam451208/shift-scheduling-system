@@ -23,7 +23,7 @@ import java.util.Map;
 
 public class WebServer {
 
-    private static final int PORT = 8080;
+    private static final int PORT = getPort();
     private static final LocalTime OPEN_TIME = LocalTime.of(10, 0);
     private static final LocalTime CLOSE_TIME = LocalTime.of(22, 0);
 
@@ -53,6 +53,24 @@ public class WebServer {
 
         System.out.println("WebServer started.");
         System.out.println("http://localhost:" + PORT + "/");
+    }
+
+    private static int getPort() {
+        String value = System.getenv("PORT");
+
+        if (value == null || value.isBlank()) {
+            return 8080;
+        }
+
+        try {
+            int port = Integer.parseInt(value);
+            if (port < 1 || port > 65535) {
+                throw new IllegalArgumentException("PORTは1から65535で指定してください。");
+            }
+            return port;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("PORTは数字で指定してください。", e);
+        }
     }
 
     private static void handle(HttpExchange exchange) throws Exception {

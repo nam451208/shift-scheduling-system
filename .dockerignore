@@ -1,0 +1,11 @@
+.git
+.gitignore
+.vscode
+.agents
+bin
+*.class
+.env
+.env.*
+*.log
+java
+javac
