@@ -1,0 +1,20 @@
+# Java build output
+bin/
+*.class
+
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
+
+# Editor and local agent settings
+.vscode/
+.agents/
+
+# Local helper files
+java
+javac
+
+# Logs and crash reports
+*.log
+hs_err_pid*
