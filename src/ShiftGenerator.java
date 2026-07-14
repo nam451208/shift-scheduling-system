@@ -48,30 +48,49 @@ public class ShiftGenerator {
             throw new IllegalArgumentException("シフト期間が正しくありません。");
         }
 
-        deleteOldShift(startDate, endDate);
+        int totalDays = (int) Duration.between(
+            startDate.atStartOfDay(),
+            endDate.plusDays(1).atStartOfDay()
+        ).toDays();
+        int completedDays = 0;
 
-        LocalDate workDate = startDate;
+        System.out.println("シフト生成を開始します: " + startDate + " 〜 " + endDate
+            + "（" + totalDays + "日間）");
+        System.out.println("既存シフトを整理しています...");
+        System.out.flush();
 
-        while (!workDate.isAfter(endDate)) {
+        try (Connection connection = DBConnection.getConnection()) {
+            deleteOldShift(connection, startDate, endDate);
 
-            LocalTime timeSlot = OPEN_TIME;
+            LocalDate workDate = startDate;
+            while (!workDate.isAfter(endDate)) {
+                System.out.println("[" + (completedDays + 1) + "/" + totalDays + "] "
+                    + workDate + " のシフトを生成中...");
+                System.out.flush();
 
-            while (timeSlot.isBefore(CLOSE_TIME)) {
+                LocalTime timeSlot = OPEN_TIME;
+                while (timeSlot.isBefore(CLOSE_TIME)) {
+                    createShift(connection, workDate, timeSlot, startDate, endDate);
+                    enforceBusinessRule(connection, workDate, timeSlot, startDate, endDate);
+                    timeSlot = addThirtyMinutes(timeSlot);
+                }
 
-                createShift(workDate, timeSlot, startDate, endDate);
-                enforceBusinessRule(workDate, timeSlot, startDate, endDate);
-
-                timeSlot = addThirtyMinutes(timeSlot);
+                completedDays++;
+                int percent = completedDays * 100 / totalDays;
+                System.out.println("[" + completedDays + "/" + totalDays + "] "
+                    + workDate + " 完了（" + percent + "%）");
+                System.out.flush();
+                workDate = workDate.plusDays(1);
             }
-
-            workDate = workDate.plusDays(1);
         }
 
+        System.out.println("勤務時間の調整中...");
+        System.out.flush();
         extendShortShifts(startDate, endDate);
-        printShortage(startDate, endDate);
 
         System.out.println("シフト自動生成が完了しました。");
         System.out.println(startDate + " から " + endDate + " まで作成しました。");
+        System.out.flush();
     }
 
     private static LocalDate getStartDate() throws Exception {
@@ -94,16 +113,17 @@ public class ShiftGenerator {
         return null;
     }
 
-    private static void deleteOldShift(LocalDate startDate, LocalDate endDate) throws Exception {
+    private static void deleteOldShift(
+        Connection connection,
+        LocalDate startDate,
+        LocalDate endDate
+    ) throws Exception {
 
         String sql =
             "DELETE FROM work_shift " +
             "WHERE work_date BETWEEN ? AND ?";
 
-        try (
-            Connection connection = DBConnection.getConnection();
-            PreparedStatement statement = connection.prepareStatement(sql)
-        ) {
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setDate(1, Date.valueOf(startDate));
             statement.setDate(2, Date.valueOf(endDate));
             statement.executeUpdate();
@@ -111,6 +131,7 @@ public class ShiftGenerator {
     }
 
     private static void createShift(
+        Connection connection,
         LocalDate workDate,
         LocalTime timeSlot,
         LocalDate periodStartDate,
@@ -127,10 +148,7 @@ public class ShiftGenerator {
             "AND time_slot = ? " +
             "ORDER BY position_id";
 
-        try (
-            Connection connection = DBConnection.getConnection();
-            PreparedStatement requiredStmt = connection.prepareStatement(requiredSql)
-        ) {
+        try (PreparedStatement requiredStmt = connection.prepareStatement(requiredSql)) {
             requiredStmt.setString(1, dayType);
             requiredStmt.setTime(2, Time.valueOf(timeSlot));
 
@@ -181,17 +199,16 @@ public class ShiftGenerator {
     }
 
     private static void enforceBusinessRule(
+        Connection connection,
         LocalDate workDate,
         LocalTime timeSlot,
         LocalDate periodStartDate,
         LocalDate periodEndDate
     ) throws Exception {
 
-        try (Connection connection = DBConnection.getConnection()) {
+        int safetyCount = 0;
 
-            int safetyCount = 0;
-
-            while (safetyCount < 10) {
+        while (safetyCount < 10) {
 
                 SlotStatus status = getSlotStatus(connection, workDate, timeSlot);
 
@@ -222,8 +239,7 @@ public class ShiftGenerator {
                     candidate.positionId
                 );
 
-                safetyCount++;
-            }
+            safetyCount++;
         }
     }
 
