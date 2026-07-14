@@ -6,6 +6,8 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
 import java.sql.Connection;
 import java.sql.Date;
 import java.sql.PreparedStatement;
@@ -14,20 +16,36 @@ import java.sql.Statement;
 import java.sql.Time;
 import java.sql.Types;
 import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.PBEKeySpec;
 
 public class WebServer {
 
     private static final int PORT = getPort();
     private static final LocalTime OPEN_TIME = LocalTime.of(10, 0);
     private static final LocalTime CLOSE_TIME = LocalTime.of(22, 0);
+    private static final String SESSION_COOKIE = "shift_session";
+    private static final Duration SESSION_LIFETIME = Duration.ofHours(12);
+    private static final int PASSWORD_ITERATIONS = 210_000;
+    private static final int PASSWORD_KEY_LENGTH = 256;
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+    private static final Map<String, Session> SESSIONS = new ConcurrentHashMap<>();
+    private static final Map<String, String> LOGIN_USERS = new LinkedHashMap<>();
+    private static final ThreadLocal<String> CURRENT_USERNAME = new ThreadLocal<>();
 
     public static void main(String[] args) throws Exception {
+        validateLoginSettings();
+        initializeLoginUsers();
         HttpServer server = HttpServer.create(new InetSocketAddress(PORT), 0);
 
         server.createContext("/", exchange -> {
@@ -45,6 +63,8 @@ public class WebServer {
                 } catch (Exception sendError) {
                     sendError.printStackTrace();
                 }
+            } finally {
+                CURRENT_USERNAME.remove();
             }
         });
 
@@ -73,8 +93,275 @@ public class WebServer {
         }
     }
 
+    private static void validateLoginSettings() {
+        LOGIN_USERS.clear();
+
+        for (int number = 1; number <= 2; number++) {
+            String username = System.getenv("APP_USERNAME_" + number);
+            String password = System.getenv("APP_PASSWORD_" + number);
+
+            if (username == null || username.isBlank() || password == null || password.isBlank()) {
+                throw new IllegalStateException(
+                    "APP_USERNAME_" + number + " と APP_PASSWORD_" + number + " を設定してください。"
+                );
+            }
+
+            username = username.trim();
+            if (LOGIN_USERS.containsKey(username)) {
+                throw new IllegalStateException("2人のログイン名は別々にしてください。");
+            }
+            if (password.length() < 8) {
+                throw new IllegalStateException("ログインパスワードは8文字以上にしてください。");
+            }
+
+            LOGIN_USERS.put(username, password);
+        }
+    }
+
+    private static void initializeLoginUsers() throws Exception {
+        String createSql =
+            "CREATE TABLE IF NOT EXISTS app_users (" +
+            "username VARCHAR(100) PRIMARY KEY, " +
+            "password_hash VARCHAR(500) NOT NULL, " +
+            "updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP " +
+            "ON UPDATE CURRENT_TIMESTAMP)";
+        String insertSql =
+            "INSERT IGNORE INTO app_users (username, password_hash) VALUES (?, ?)";
+
+        try (Connection connection = DBConnection.getConnection()) {
+            try (PreparedStatement statement = connection.prepareStatement(createSql)) {
+                statement.executeUpdate();
+            }
+
+            try (PreparedStatement statement = connection.prepareStatement(insertSql)) {
+                for (Map.Entry<String, String> user : LOGIN_USERS.entrySet()) {
+                    statement.setString(1, user.getKey());
+                    statement.setString(2, hashPassword(user.getValue()));
+                    statement.addBatch();
+                }
+                statement.executeBatch();
+            }
+        }
+
+        LOGIN_USERS.clear();
+    }
+
+    private static void handleLogin(HttpExchange exchange) throws Exception {
+        if (getSession(exchange) != null) {
+            redirect(exchange, "/");
+            return;
+        }
+
+        if (exchange.getRequestMethod().equalsIgnoreCase("GET")) {
+            send(exchange, renderLoginPage(false));
+            return;
+        }
+
+        if (!exchange.getRequestMethod().equalsIgnoreCase("POST")) {
+            sendMethodNotAllowed(exchange);
+            return;
+        }
+
+        Map<String, String> params = getParams(exchange);
+        String username = params.getOrDefault("username", "").trim();
+        String password = params.getOrDefault("password", "");
+        if (!authenticate(username, password)) {
+            send(exchange, renderLoginPage(true));
+            return;
+        }
+
+        byte[] tokenBytes = new byte[32];
+        SECURE_RANDOM.nextBytes(tokenBytes);
+        String token = Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes);
+        SESSIONS.put(token, new Session(username, Instant.now().plus(SESSION_LIFETIME)));
+
+        String cookie = SESSION_COOKIE + "=" + token
+            + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=" + SESSION_LIFETIME.toSeconds();
+        if (isHttps(exchange)) {
+            cookie += "; Secure";
+        }
+        exchange.getResponseHeaders().add("Set-Cookie", cookie);
+        redirect(exchange, "/");
+    }
+
+    private static void handleLogout(HttpExchange exchange) throws Exception {
+        if (!exchange.getRequestMethod().equalsIgnoreCase("POST")) {
+            redirect(exchange, "/login");
+            return;
+        }
+
+        String token = getCookie(exchange, SESSION_COOKIE);
+        if (token != null) {
+            SESSIONS.remove(token);
+        }
+
+        String cookie = SESSION_COOKIE + "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
+        if (isHttps(exchange)) {
+            cookie += "; Secure";
+        }
+        exchange.getResponseHeaders().add("Set-Cookie", cookie);
+        redirect(exchange, "/login");
+    }
+
+    private static boolean authenticate(String username, String password) throws Exception {
+        String sql = "SELECT password_hash FROM app_users WHERE username = ?";
+
+        try (
+            Connection connection = DBConnection.getConnection();
+            PreparedStatement statement = connection.prepareStatement(sql)
+        ) {
+            statement.setString(1, username);
+            try (ResultSet rs = statement.executeQuery()) {
+                return rs.next() && verifyPassword(password, rs.getString("password_hash"));
+            }
+        }
+    }
+
+    private static String hashPassword(String password) throws Exception {
+        byte[] salt = new byte[16];
+        SECURE_RANDOM.nextBytes(salt);
+        byte[] hash = derivePassword(password, salt, PASSWORD_ITERATIONS);
+        return PASSWORD_ITERATIONS + ":"
+            + Base64.getEncoder().encodeToString(salt) + ":"
+            + Base64.getEncoder().encodeToString(hash);
+    }
+
+    private static boolean verifyPassword(String password, String storedHash) throws Exception {
+        if (storedHash == null) {
+            return false;
+        }
+
+        String[] parts = storedHash.split(":", 3);
+        if (parts.length != 3) {
+            return false;
+        }
+
+        try {
+            int iterations = Integer.parseInt(parts[0]);
+            byte[] salt = Base64.getDecoder().decode(parts[1]);
+            byte[] expected = Base64.getDecoder().decode(parts[2]);
+            byte[] actual = derivePassword(password, salt, iterations);
+            return MessageDigest.isEqual(expected, actual);
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+    }
+
+    private static byte[] derivePassword(String password, byte[] salt, int iterations) throws Exception {
+        PBEKeySpec spec = new PBEKeySpec(password.toCharArray(), salt, iterations, PASSWORD_KEY_LENGTH);
+        try {
+            return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+                .generateSecret(spec)
+                .getEncoded();
+        } finally {
+            spec.clearPassword();
+        }
+    }
+
+    private static Session getSession(HttpExchange exchange) {
+        String token = getCookie(exchange, SESSION_COOKIE);
+        if (token == null) {
+            return null;
+        }
+
+        Session session = SESSIONS.get(token);
+        if (session == null) {
+            return null;
+        }
+        if (session.expiresAt.isBefore(Instant.now())) {
+            SESSIONS.remove(token);
+            return null;
+        }
+
+        CURRENT_USERNAME.set(session.username);
+        return session;
+    }
+
+    private static String getCookie(HttpExchange exchange, String name) {
+        List<String> headers = exchange.getRequestHeaders().get("Cookie");
+        if (headers == null) {
+            return null;
+        }
+
+        for (String header : headers) {
+            for (String part : header.split(";")) {
+                String[] pair = part.trim().split("=", 2);
+                if (pair.length == 2 && pair[0].equals(name)) {
+                    return pair[1];
+                }
+            }
+        }
+        return null;
+    }
+
+    private static boolean isHttps(HttpExchange exchange) {
+        String forwardedProto = exchange.getRequestHeaders().getFirst("X-Forwarded-Proto");
+        return "https".equalsIgnoreCase(forwardedProto);
+    }
+
+    private static void sendMethodNotAllowed(HttpExchange exchange) throws Exception {
+        byte[] bytes = "Method Not Allowed".getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "text/plain; charset=UTF-8");
+        exchange.sendResponseHeaders(405, bytes.length);
+        try (OutputStream outputStream = exchange.getResponseBody()) {
+            outputStream.write(bytes);
+        }
+    }
+
+    private static String renderLoginPage(boolean failed) {
+        String message = failed
+            ? "<p class='error'>ログイン名またはパスワードが違います。</p>"
+            : "<p>登録されたアカウントでログインしてください。</p>";
+
+        return "<!DOCTYPE html><html lang='ja'><head>"
+            + "<meta charset='UTF-8'>"
+            + "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+            + "<title>ログイン</title>"
+            + "<style>"
+            + "*{box-sizing:border-box;}body{margin:0;background:#f4f7fb;color:#071421;font-family:Arial,'Yu Gothic',Meiryo,sans-serif;}"
+            + ".login-page{min-height:100vh;display:grid;place-items:center;padding:20px;}"
+            + ".login-card{width:min(420px,100%);background:#fff;border:1px solid #d5e0ea;border-radius:10px;padding:28px;}"
+            + "h1{margin:0 0 12px;}p{color:#52606d;line-height:1.5;}.error{color:#b42318;font-weight:700;}"
+            + "label{display:flex;flex-direction:column;gap:8px;margin:0 0 18px;font-weight:700;}"
+            + "input{height:46px;padding:0 12px;border:1px solid #cbd6e2;border-radius:6px;font-size:16px;}"
+            + "button{width:100%;height:48px;border:0;border-radius:6px;background:#247bd1;color:#fff;font-size:17px;font-weight:700;cursor:pointer;}"
+            + "</style></head><body><main class='login-page'><section class='login-card'>"
+            + "<h1>シフト管理 ログイン</h1>" + message
+            + "<form method='post' action='/login'>"
+            + "<label>ログイン名<input name='username' autocomplete='username' required autofocus></label>"
+            + "<label>パスワード<input type='password' name='password' autocomplete='current-password' required></label>"
+            + "<button type='submit'>ログイン</button>"
+            + "</form></section></main></body></html>";
+    }
+
     private static void handle(HttpExchange exchange) throws Exception {
         String path = exchange.getRequestURI().getPath();
+
+        if (path.equals("/login")) {
+            handleLogin(exchange);
+            return;
+        }
+
+        if (path.equals("/logout")) {
+            handleLogout(exchange);
+            return;
+        }
+
+        Session session = getSession(exchange);
+        if (session == null) {
+            redirect(exchange, "/login");
+            return;
+        }
+
+        if (path.equals("/password")) {
+            send(exchange, renderLayout("パスワード変更", renderPasswordForm(exchange)));
+            return;
+        }
+
+        if (path.equals("/password-save")) {
+            savePassword(exchange, session);
+            return;
+        }
 
         if (path.equals("/")) {
             send(exchange, renderLayout("ホーム", renderHome()));
@@ -162,6 +449,74 @@ public class WebServer {
         }
 
         send(exchange, renderLayout("404", "<h1>ページが見つかりません</h1>"));
+    }
+
+    private static String renderPasswordForm(HttpExchange exchange) throws Exception {
+        String result = getParams(exchange).get("result");
+        StringBuilder html = new StringBuilder();
+        html.append("<section class='panel password-panel'>");
+        html.append("<h1>パスワード変更</h1>");
+
+        if ("updated".equals(result)) {
+            html.append("<p class='success'>パスワードを変更しました。</p>");
+        } else if ("current-error".equals(result)) {
+            html.append("<p class='error'>現在のパスワードが違います。</p>");
+        } else if ("mismatch".equals(result)) {
+            html.append("<p class='error'>新しいパスワードが一致していません。</p>");
+        } else if ("invalid".equals(result)) {
+            html.append("<p class='error'>新しいパスワードは8文字以上にしてください。</p>");
+        }
+
+        html.append("<form class='password-form' method='post' action='/password-save'>");
+        html.append("<label>現在のパスワード<input type='password' name='current_password' autocomplete='current-password' required></label>");
+        html.append("<label>新しいパスワード<input type='password' name='new_password' minlength='8' autocomplete='new-password' required></label>");
+        html.append("<label>新しいパスワード（確認）<input type='password' name='confirm_password' minlength='8' autocomplete='new-password' required></label>");
+        html.append("<button class='submit-button' type='submit'>変更する</button>");
+        html.append("</form></section>");
+        return html.toString();
+    }
+
+    private static void savePassword(HttpExchange exchange, Session session) throws Exception {
+        if (!exchange.getRequestMethod().equalsIgnoreCase("POST")) {
+            sendMethodNotAllowed(exchange);
+            return;
+        }
+
+        Map<String, String> params = getParams(exchange);
+        String currentPassword = params.getOrDefault("current_password", "");
+        String newPassword = params.getOrDefault("new_password", "");
+        String confirmPassword = params.getOrDefault("confirm_password", "");
+
+        if (newPassword.length() < 8) {
+            redirect(exchange, "/password?result=invalid");
+            return;
+        }
+        if (!newPassword.equals(confirmPassword)) {
+            redirect(exchange, "/password?result=mismatch");
+            return;
+        }
+        if (!authenticate(session.username, currentPassword)) {
+            redirect(exchange, "/password?result=current-error");
+            return;
+        }
+
+        String sql = "UPDATE app_users SET password_hash = ? WHERE username = ?";
+        try (
+            Connection connection = DBConnection.getConnection();
+            PreparedStatement statement = connection.prepareStatement(sql)
+        ) {
+            statement.setString(1, hashPassword(newPassword));
+            statement.setString(2, session.username);
+            if (statement.executeUpdate() != 1) {
+                throw new IllegalStateException("ログインユーザーが見つかりません。");
+            }
+        }
+
+        String currentToken = getCookie(exchange, SESSION_COOKIE);
+        SESSIONS.entrySet().removeIf(entry ->
+            entry.getValue().username.equals(session.username) && !entry.getKey().equals(currentToken)
+        );
+        redirect(exchange, "/password?result=updated");
     }
 
     private static String renderHome() {
@@ -1793,6 +2148,8 @@ public class WebServer {
             + ".nav{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 28px;}"
             + ".nav a{display:inline-flex;align-items:center;justify-content:center;height:46px;padding:0 18px;border:1px solid #ccd8e4;border-radius:6px;background:#fff;color:#071421;text-decoration:none;font-weight:700;}"
             + ".nav a.primary{background:#247bd1;color:#fff;border-color:#247bd1;}"
+            + ".nav-user{display:flex;align-items:center;gap:8px;margin-left:auto;font-weight:700;}"
+            + ".logout-button{height:46px;padding:0 16px;border:1px solid #ccd8e4;border-radius:6px;background:#fff;color:#071421;font-weight:700;cursor:pointer;}"
             + ".panel,.shift-card{background:#fff;border:1px solid #d5e0ea;border-radius:6px;padding:18px;margin:0 0 28px;}"
             + ".home-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-top:18px;}"
             + ".home-card{display:flex;flex-direction:column;gap:8px;background:#fff;border:1px solid #d5e0ea;border-radius:6px;padding:18px;text-decoration:none;color:#071421;}"
@@ -1840,6 +2197,15 @@ public class WebServer {
             + ".hour-area div{padding:13px 0;text-align:center;font-weight:700;border-right:1px solid #d5e0ea;font-size:14px;}"
             + ".shift-line{position:relative;display:grid;grid-template-columns:repeat(26,36px);min-height:48px;border-bottom:1px solid #e4ebf2;background:repeating-linear-gradient(to right,#fff 0,#fff 35px,#dfe7ef 36px);}"
             + ".shift-bar{align-self:center;height:32px;line-height:32px;background:#2780d8;color:#fff;border-radius:6px;text-align:center;font-size:14px;font-weight:700;overflow:hidden;white-space:nowrap;}"
+            + ".login-page{min-height:100vh;display:grid;place-items:center;padding:20px;}"
+            + ".login-card{width:min(420px,100%);background:#fff;border:1px solid #d5e0ea;border-radius:10px;padding:28px;}"
+            + ".login-card label{display:flex;flex-direction:column;gap:8px;margin:0 0 18px;font-weight:700;}"
+            + ".login-card input{height:46px;padding:0 12px;border:1px solid #cbd6e2;border-radius:6px;font-size:16px;}"
+            + ".login-card button{width:100%;height:48px;border:0;border-radius:6px;background:#247bd1;color:#fff;font-size:17px;font-weight:700;cursor:pointer;}"
+            + ".password-panel{max-width:520px;margin-left:auto;margin-right:auto;}"
+            + ".password-form{display:flex;flex-direction:column;gap:18px;}"
+            + ".password-form label{display:flex;flex-direction:column;gap:8px;font-weight:700;}"
+            + ".password-form input{height:46px;padding:0 12px;border:1px solid #cbd6e2;border-radius:6px;font-size:16px;}"
             + "pre{white-space:pre-wrap;background:#0f172a;color:#e5e7eb;padding:16px;border-radius:6px;overflow:auto;}"
             + "@media(max-width:600px){"
             + "*,*::before,*::after{box-sizing:border-box;}"
@@ -1848,6 +2214,8 @@ public class WebServer {
             + "h1{font-size:24px;margin-bottom:20px;}h2{font-size:18px;}"
             + ".nav{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:20px;}"
             + ".nav a{width:100%;height:44px;padding:0 6px;font-size:14px;text-align:center;}"
+            + ".nav-user{grid-column:1/-1;margin-left:0;justify-content:space-between;background:#fff;padding:8px 10px;border:1px solid #ccd8e4;border-radius:6px;}"
+            + ".logout-button{height:38px;}"
             + ".panel{padding:12px;margin-bottom:18px;overflow:hidden;}"
             + ".home-grid{grid-template-columns:1fr;}.home-card{padding:15px;}"
             + "table{display:block;width:100%;min-width:560px;overflow-x:auto;white-space:nowrap;-webkit-overflow-scrolling:touch;}"
@@ -1882,6 +2250,7 @@ public class WebServer {
     }
 
     private static String nav() {
+        String username = CURRENT_USERNAME.get();
         return "<nav class='nav'>"
             + "<a href='/'>ホーム</a>"
             + "<a class='primary' href='/generate'>シフト自動生成</a>"
@@ -1894,6 +2263,9 @@ public class WebServer {
             + "<a href='/employees'>従業員</a>"
             + "<a href='/positions'>ポジション</a>"
             + "<a href='/required-staff'>必要人数</a>"
+            + "<a href='/password'>パスワード変更</a>"
+            + "<span class='nav-user'><span>ログイン中: " + escape(username) + "</span>"
+            + "<form method='post' action='/logout'><button class='logout-button' type='submit'>ログアウト</button></form></span>"
             + "</nav>";
     }
 
@@ -2002,6 +2374,16 @@ public class WebServer {
         }
 
         return builder.toString();
+    }
+
+    private static class Session {
+        String username;
+        Instant expiresAt;
+
+        Session(String username, Instant expiresAt) {
+            this.username = username;
+            this.expiresAt = expiresAt;
+        }
     }
 
     private static class EmployeeOption {
