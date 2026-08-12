@@ -1,18 +1,53 @@
-## Getting Started
+# シフト自動作成システム
 
-Welcome to the VS Code Java world. Here is a guideline to help you get started to write Java code in Visual Studio Code.
+## 概要
+アルバイト先のシフト作成業務を効率化するために開発したシフト自動作成システムです。
 
-## Folder Structure
+店長へのヒアリングをもとに、従業員の希望シフトや経験レベル、曜日・時間帯ごとの必要人数など、実際の店舗で考慮されている条件を整理し、自動でシフトを生成できるようにしました。
 
-The workspace contains two folders by default, where:
+現在は実際の店舗で運用しています。
 
-- `src`: the folder to maintain sources
-- `lib`: the folder to maintain dependencies
+## 開発背景
+アルバイト先では、店長が営業時間後に手作業でシフトを作成していました。
 
-Meanwhile, the compiled output files will be generated in the `bin` folder by default.
+そこで、大学で学んだITの知識を活かして店長の負担を軽減したいと考え、シフト自動作成システムの開発に取り組みました。
 
-> If you want to customize the folder structure, open `.vscode/settings.json` and update the related settings there.
+単にシフトを自動生成するだけでなく、実際の業務で使えるシステムにすることを目標とし、店長やアルバイト仲間へのヒアリングを重ねながら開発しました。
 
-## Dependency Management
+## 主な機能
+- 従業員情報の登録・編集・削除
+- 従業員ごとのポジション・経験レベルの管理
+- 希望シフトの登録・管理
+- 曜日・時間帯ごとの必要人数の設定
+- 条件に基づいたシフトの自動生成
+- 生成したシフトの確認
 
-The `JAVA PROJECTS` view allows you to manage your dependencies. More details can be found [here](https://github.com/microsoft/vscode-java-dependency#manage-dependencies).
+## シフト生成で考慮している条件
+- 従業員の希望シフト
+- 曜日・時間帯ごとの必要人数
+- ホール・キッチンなどのポジション
+- 従業員ごとの経験レベル
+- 最低勤務時間
+- 従業員間の勤務時間の偏り
+
+当初は必要人数を満たすことを優先していましたが、一部の従業員に勤務が偏る課題が発生しました。
+
+そこで、条件の優先順位を見直すとともに、曜日区分を4パターンに細分化し、1時間単位で必要人数や経験レベルを設定できるよう改善しました。
+
+条件同士が競合する場合は、店長へのヒアリングを通じて実際のシフト作成で何を優先しているのかを確認し、生成条件に反映しました。
+
+## 成果
+シフトの集計・配置・調整を含む作成業務全体を、約4時間から約30分に短縮しました。
+
+また、ITに苦手意識のある店長でも利用できることを意識して設計し、現在も実際の店舗で運用しています。
+
+## 使用技術
+- Java
+- MySQL
+- JDBC
+- Git / GitHub
+
+## 今後の改善
+- 操作画面のさらなる改善
+- シフト生成ロジックの改善
+- 利用者からのフィードバックをもとにした機能追加
