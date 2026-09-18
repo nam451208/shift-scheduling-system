@@ -1495,6 +1495,14 @@ public class WebServer {
         Map<String, String> params = getParams(exchange);
 
         DateRange period = getConfiguredPeriod();
+        boolean invalidPeriod = false;
+        if (params.containsKey("period_start") || params.containsKey("period_end")) {
+            try {
+                period = parseRequestPeriod(params);
+            } catch (IllegalArgumentException e) {
+                invalidPeriod = true;
+            }
+        }
         LocalDate periodStart = period.start;
         LocalDate periodEnd = period.end;
         int periodDays = (int) Duration.between(
@@ -1519,6 +1527,10 @@ public class WebServer {
         StringBuilder html = new StringBuilder();
 
         html.append("<h1>希望入力</h1>");
+        if (invalidPeriod || "invalid".equals(params.get("result"))) {
+            html.append("<p class='error'>開始日と終了日を確認してください。期間は最大62日です。</p>");
+        }
+        html.append("<p>入力する期間を選んで「表示」を押してください。期間を変更する前に、入力中の希望を提出してください。</p>");
 
         html.append("<form class='filter-form' method='get' action='/request-form'>");
         html.append("<label>従業員</label>");
@@ -1533,6 +1545,10 @@ public class WebServer {
         }
 
         html.append("</select>");
+        html.append("<label>開始日<input type='date' name='period_start' required value='")
+            .append(periodStart).append("'></label>");
+        html.append("<label>終了日<input type='date' name='period_end' required value='")
+            .append(periodEnd).append("'></label>");
         html.append("<button type='submit'>表示</button>");
         html.append("</form>");
 
@@ -1648,21 +1664,37 @@ public class WebServer {
         return html.toString();
     }
 
+    private static DateRange parseRequestPeriod(Map<String, String> params) {
+        try {
+            LocalDate start = LocalDate.parse(params.getOrDefault("period_start", ""));
+            LocalDate end = LocalDate.parse(params.getOrDefault("period_end", ""));
+            long days = java.time.temporal.ChronoUnit.DAYS.between(start, end) + 1;
+            if (days < 1 || days > 62) {
+                throw new IllegalArgumentException("期間は1日以上62日以内で指定してください。");
+            }
+            return new DateRange(start, end);
+        } catch (java.time.format.DateTimeParseException e) {
+            throw new IllegalArgumentException("開始日と終了日を確認してください。", e);
+        }
+    }
+
     private static void renderRequestSave(HttpExchange exchange) throws Exception {
         Map<String, String> params = getParams(exchange);
 
         int employeeId = Integer.parseInt(params.get("employee_id"));
-        LocalDate periodStart = LocalDate.parse(params.get("period_start"));
-        LocalDate periodEnd = LocalDate.parse(params.get("period_end"));
+        DateRange period;
+        try {
+            period = parseRequestPeriod(params);
+        } catch (IllegalArgumentException e) {
+            redirect(exchange, "/request-form?result=invalid&employee_id=" + employeeId);
+            return;
+        }
+        LocalDate periodStart = period.start;
+        LocalDate periodEnd = period.end;
         int periodDays = (int) Duration.between(
             periodStart.atStartOfDay(),
             periodEnd.plusDays(1).atStartOfDay()
         ).toDays();
-
-        if (periodEnd.isBefore(periodStart) || periodDays < 1 || periodDays > 62) {
-            redirect(exchange, "/request-form");
-            return;
-        }
 
         try (Connection connection = DBConnection.getConnection()) {
             connection.setAutoCommit(false);
