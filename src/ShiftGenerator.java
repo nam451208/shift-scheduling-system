@@ -105,6 +105,7 @@ public class ShiftGenerator {
         progress.accept(new Progress(Stage.ADJUSTING, completedSlots, totalSlots, null, null));
         extendShortShifts(startDate, endDate);
         rebalancePositions(startDate, endDate);
+        repairCoverage(startDate, endDate);
 
         System.out.println("シフト自動生成が完了しました。");
         System.out.println(startDate + " から " + endDate + " まで作成しました。");
@@ -112,6 +113,101 @@ public class ShiftGenerator {
     }
 
     private record AllocationSlot(LocalDate date, LocalTime start, LocalTime end) { }
+
+    private static void repairCoverage(LocalDate startDate, LocalDate endDate) throws Exception {
+        // Work backwards from remaining shortages to a feasible continuous shift.
+        // In particular, an 18:30 shortage may require reserving 18:00-22:00.
+        try (Connection connection = DBConnection.getConnection()) {
+            connection.setAutoCommit(false);
+            try {
+                for (LocalDate day=startDate; !day.isAfter(endDate); day=day.plusDays(1)) {
+                    repairDayCoverage(connection, day);
+                }
+                connection.commit();
+            } catch (Exception e) {
+                connection.rollback();
+                throw e;
+            }
+        }
+    }
+
+    private static void repairDayCoverage(Connection connection, LocalDate day) throws Exception {
+        var workers = new java.util.TreeMap<Integer,CoverageRepair.Worker>();
+        try (PreparedStatement stmt=connection.prepareStatement(
+                "SELECT r.employee_id, e.employment_type, r.start_time, r.end_time, ep.position_id "
+                + "FROM request_shift r JOIN employees e ON e.employee_id=r.employee_id "
+                + "JOIN employee_position ep ON ep.employee_id=r.employee_id "
+                + "WHERE r.work_date=? AND r.is_submitted=true AND e.is_active=true")) {
+            stmt.setDate(1,Date.valueOf(day));
+            try (ResultSet rs=stmt.executeQuery()) {
+                while(rs.next()) {
+                    int id=rs.getInt("employee_id");
+                    if (!workers.containsKey(id)) workers.put(id,new CoverageRepair.Worker(id,rs.getString("employment_type")));
+                    var w=workers.get(id);
+                    w.positions.add(rs.getInt("position_id"));
+                    LocalTime start=rs.getTime("start_time").toLocalTime(), end=rs.getTime("end_time").toLocalTime();
+                    for(int s=0;s<24;s++) {
+                        LocalTime t=OPEN_TIME.plusMinutes(s*30);
+                        if(!t.isBefore(start) && !t.plusMinutes(30).isAfter(end)) w.available[s]=true;
+                    }
+                }
+            }
+        }
+        for (var worker : workers.values()) {
+            for (boolean available : worker.available) if (available) worker.requestedSlots++;
+        }
+        try (PreparedStatement stmt=connection.prepareStatement(
+                "SELECT employee_id, start_time, end_time FROM employee_day_off WHERE off_date=?")) {
+            stmt.setDate(1,Date.valueOf(day));
+            try(ResultSet rs=stmt.executeQuery()) {
+                while(rs.next()) {
+                    var w=workers.get(rs.getInt("employee_id"));
+                    if(w==null) continue;
+                    Time start=rs.getTime("start_time"), end=rs.getTime("end_time");
+                    for(int s=0;s<24;s++) {
+                        LocalTime t=OPEN_TIME.plusMinutes(s*30);
+                        if(start==null || end==null || (t.isBefore(end.toLocalTime())
+                                && t.plusMinutes(30).isAfter(start.toLocalTime()))) w.available[s]=false;
+                    }
+                }
+            }
+        }
+        try(PreparedStatement stmt=connection.prepareStatement(
+                "SELECT ws.employee_id, e.employment_type, ws.start_time, ws.end_time, ws.position_id "
+                + "FROM work_shift ws JOIN employees e ON e.employee_id=ws.employee_id WHERE ws.work_date=?")) {
+            stmt.setDate(1,Date.valueOf(day));
+            try(ResultSet rs=stmt.executeQuery()) {
+                while(rs.next()) {
+                    int id=rs.getInt("employee_id");
+                    if(!workers.containsKey(id)) workers.put(id,new CoverageRepair.Worker(id,rs.getString("employment_type")));
+                    var w=workers.get(id);
+                    LocalTime start=rs.getTime("start_time").toLocalTime(), end=rs.getTime("end_time").toLocalTime();
+                    for(int s=0;s<24;s++) {
+                        LocalTime t=OPEN_TIME.plusMinutes(s*30);
+                        if(t.isBefore(end) && t.plusMinutes(30).isAfter(start)) w.assigned[s]=rs.getInt("position_id");
+                    }
+                }
+            }
+        }
+        var requirements=new java.util.LinkedHashMap<Integer,int[]>();
+        try(PreparedStatement stmt=connection.prepareStatement(
+                "SELECT r.position_id, r.time_slot, r.required_count FROM required_staff r "
+                + "JOIN positions p ON p.position_id=r.position_id WHERE r.day_type=? "
+                + "ORDER BY CASE WHEN p.position_name='キッチン' THEN 0 ELSE 1 END, r.position_id")) {
+            stmt.setString(1,getDayType(day));
+            try(ResultSet rs=stmt.executeQuery()) {
+                while(rs.next()) {
+                    long minute=Duration.between(OPEN_TIME,rs.getTime("time_slot").toLocalTime()).toMinutes();
+                    if(minute<0 || minute>=720 || minute%30!=0) continue;
+                    requirements.computeIfAbsent(rs.getInt("position_id"),k -> new int[24])[(int)minute/30]=rs.getInt("required_count");
+                }
+            }
+        }
+        for(var addition:CoverageRepair.repair(new java.util.ArrayList<>(workers.values()),requirements)) {
+            LocalTime start=OPEN_TIME.plusMinutes(addition.slot()*30);
+            insertShift(connection,addition.employee(),day,start,start.plusMinutes(30),addition.position());
+        }
+    }
 
     private static void rebalancePositions(LocalDate startDate, LocalDate endDate) throws Exception {
         // Load once, rather than adding remote SQL queries for every half-hour slot.
