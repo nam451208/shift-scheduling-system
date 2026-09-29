@@ -104,10 +104,78 @@ public class ShiftGenerator {
         System.out.flush();
         progress.accept(new Progress(Stage.ADJUSTING, completedSlots, totalSlots, null, null));
         extendShortShifts(startDate, endDate);
+        rebalancePositions(startDate, endDate);
 
         System.out.println("シフト自動生成が完了しました。");
         System.out.println(startDate + " から " + endDate + " まで作成しました。");
         System.out.flush();
+    }
+
+    private record AllocationSlot(LocalDate date, LocalTime start, LocalTime end) { }
+
+    private static void rebalancePositions(LocalDate startDate, LocalDate endDate) throws Exception {
+        // Load once, rather than adding remote SQL queries for every half-hour slot.
+        try (Connection connection = DBConnection.getConnection()) {
+            var skills = new java.util.HashMap<Integer, java.util.Map<Integer, Integer>>();
+            try (PreparedStatement stmt = connection.prepareStatement(
+                    "SELECT employee_id, position_id, position_level FROM employee_position");
+                 ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) skills.computeIfAbsent(rs.getInt("employee_id"),
+                    key -> new java.util.HashMap<>()).put(rs.getInt("position_id"), rs.getInt("position_level"));
+            }
+            var requirements = new java.util.HashMap<String, java.util.Map<LocalTime, java.util.Map<Integer, Integer>>>();
+            try (PreparedStatement stmt = connection.prepareStatement(
+                    "SELECT r.day_type, r.time_slot, r.position_id, r.required_count "
+                    + "FROM required_staff r JOIN positions p ON p.position_id = r.position_id "
+                    + "ORDER BY CASE WHEN p.position_name = 'キッチン' THEN 0 ELSE 1 END, r.position_id");
+                 ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) requirements.computeIfAbsent(rs.getString("day_type"),
+                    key -> new java.util.HashMap<>()).computeIfAbsent(rs.getTime("time_slot").toLocalTime(),
+                    key -> new java.util.LinkedHashMap<>()).put(rs.getInt("position_id"), rs.getInt("required_count"));
+            }
+            var slots = new java.util.LinkedHashMap<AllocationSlot, java.util.List<PositionAllocator.Assignment>>();
+            try (PreparedStatement stmt = connection.prepareStatement(
+                    "SELECT employee_id, work_date, start_time, end_time, position_id FROM work_shift "
+                    + "WHERE work_date BETWEEN ? AND ? ORDER BY work_date, start_time, employee_id")) {
+                stmt.setDate(1, Date.valueOf(startDate));
+                stmt.setDate(2, Date.valueOf(endDate));
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        var slot = new AllocationSlot(rs.getDate("work_date").toLocalDate(),
+                            rs.getTime("start_time").toLocalTime(), rs.getTime("end_time").toLocalTime());
+                        int employee = rs.getInt("employee_id");
+                        slots.computeIfAbsent(slot, key -> new java.util.ArrayList<>()).add(
+                            new PositionAllocator.Assignment(employee, rs.getInt("position_id"),
+                                skills.getOrDefault(employee, java.util.Map.of())));
+                    }
+                }
+            }
+            connection.setAutoCommit(false);
+            try (PreparedStatement update = connection.prepareStatement(
+                    "UPDATE work_shift SET position_id = ? WHERE employee_id = ? AND work_date = ? "
+                    + "AND start_time = ? AND end_time = ? AND position_id = ?")) {
+                for (var entry : slots.entrySet()) {
+                    AllocationSlot slot = entry.getKey();
+                    PositionAllocator.rebalance(entry.getValue(), requirements
+                        .getOrDefault(getDayType(slot.date()), java.util.Map.of())
+                        .getOrDefault(slot.start(), java.util.Map.of()));
+                    for (var a : entry.getValue()) {
+                        if (a.position == a.originalPosition) continue;
+                        update.setInt(1, a.position);
+                        update.setInt(2, a.employeeId);
+                        update.setDate(3, Date.valueOf(slot.date()));
+                        update.setTime(4, Time.valueOf(slot.start()));
+                        update.setTime(5, Time.valueOf(slot.end()));
+                        update.setInt(6, a.originalPosition);
+                        if (update.executeUpdate() != 1) throw new java.sql.SQLException("Assignment changed during rebalancing");
+                    }
+                }
+                connection.commit();
+            } catch (Exception e) {
+                connection.rollback();
+                throw e;
+            }
+        }
     }
 
     private static LocalDate getStartDate() throws Exception {
@@ -159,11 +227,11 @@ public class ShiftGenerator {
         LocalTime nextTime = addThirtyMinutes(timeSlot);
 
         String requiredSql =
-            "SELECT position_id, required_count " +
-            "FROM required_staff " +
+            "SELECT rs.position_id, rs.required_count " +
+            "FROM required_staff rs JOIN positions p ON p.position_id = rs.position_id " +
             "WHERE day_type = ? " +
             "AND time_slot = ? " +
-            "ORDER BY position_id";
+            "ORDER BY CASE WHEN p.position_name = 'キッチン' THEN 0 ELSE 1 END, rs.position_id";
 
         try (PreparedStatement requiredStmt = connection.prepareStatement(requiredSql)) {
             requiredStmt.setString(1, dayType);
@@ -524,6 +592,8 @@ public class ShiftGenerator {
             "period_work_count ASC, " +
             "period_request_slots DESC, " +
             "daily_work_count ASC, " +
+            // Preserve flexible staff when an equally suitable specialist is available.
+            "(SELECT COUNT(*) FROM employee_position skills WHERE skills.employee_id = r.employee_id) ASC, " +
             "ep.position_level DESC, " +
             "r.employee_id, " +
             "ep.position_id";
