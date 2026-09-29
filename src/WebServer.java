@@ -43,6 +43,17 @@ public class WebServer {
     private static final Map<String, Session> SESSIONS = new ConcurrentHashMap<>();
     private static final Map<String, String> LOGIN_USERS = new LinkedHashMap<>();
     private static final ThreadLocal<String> CURRENT_USERNAME = new ThreadLocal<>();
+    private static final GenerationService GENERATION = new GenerationService(
+        Executors.newSingleThreadExecutor(task -> {
+            Thread thread = new Thread(task, "shift-generation");
+            thread.setDaemon(true);
+            return thread;
+        }),
+        (start, end, progress) -> {
+            saveConfiguredPeriod(start, end);
+            ShiftGenerator.generateShift(start, end, progress);
+        }
+    );
 
     public static void main(String[] args) throws Exception {
         validateLoginSettings();
@@ -444,6 +455,11 @@ public class WebServer {
             return;
         }
 
+        if (path.equals("/generate-status")) {
+            sendGenerationStatus(exchange);
+            return;
+        }
+
         if (path.equals("/shifts")) {
             send(exchange, renderLayout("シフト結果", renderShifts()));
             return;
@@ -465,7 +481,7 @@ public class WebServer {
         }
 
         if (path.equals("/requests")) {
-            send(exchange, renderLayout("希望一覧", renderRequests()));
+            send(exchange, renderLayout("希望一覧", renderRequests(exchange)));
             return;
         }
 
@@ -620,17 +636,16 @@ public class WebServer {
     }
 
     private static String renderGenerate(HttpExchange exchange) throws Exception {
-        DateRange period = getConfiguredPeriod();
+        DateRange period = getInputPeriod();
         String result = getParams(exchange).get("result");
         StringBuilder html = new StringBuilder();
 
         html.append("<section class='panel generate-panel'>");
         html.append("<h1>シフト自動生成</h1>");
-        if ("success".equals(result)) {
-            html.append("<p class='success'>指定した期間のシフト自動生成が完了しました。</p>");
-            html.append("<p><a class='primary-link' href='/shifts'>シフト結果を見る</a></p>");
-        } else if ("invalid".equals(result)) {
+        if ("invalid".equals(result)) {
             html.append("<p class='error'>開始日と終了日を確認してください。期間は最大62日です。</p>");
+        } else if ("busy".equals(result)) {
+            html.append("<p role='status'>すでに生成中です。下の進捗をご確認ください。</p>");
         }
 
         html.append("<p>希望入力とシフト生成に使用する期間を指定します。</p>");
@@ -640,8 +655,12 @@ public class WebServer {
             .append(period.start).append("'></label>");
         html.append("<label>終了日<input type='date' name='end_date' required value='")
             .append(period.end).append("'></label>");
+        appendMonthShortcuts(html, "start_date", "end_date");
+        html.append("<p>新人は1日連続3時間で配置します。希望時間・休み・21時までの制限により3時間を確保できない日は未配置になります。</p>");
         html.append("<button class='submit-button' type='submit'>この期間で生成する</button>");
-        html.append("</form></section>");
+        html.append("</form>");
+        html.append(renderGenerationProgress());
+        html.append("</section>");
         return html.toString();
     }
 
@@ -668,9 +687,87 @@ public class WebServer {
             return;
         }
 
-        saveConfiguredPeriod(start, end);
-        ShiftGenerator.generateShift(start, end);
-        redirect(exchange, "/generate?result=success");
+        boolean started = GENERATION.start(start, end);
+        redirect(exchange, started ? "/generate" : "/generate?result=busy");
+    }
+
+    private static void sendGenerationStatus(HttpExchange exchange) throws Exception {
+        if (!exchange.getRequestMethod().equalsIgnoreCase("GET")) {
+            exchange.getResponseHeaders().set("Allow", "GET");
+            sendMethodNotAllowed(exchange);
+            return;
+        }
+        byte[] bytes = GENERATION.snapshot().toJson().getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
+        exchange.getResponseHeaders().set("Cache-Control", "no-store");
+        exchange.sendResponseHeaders(200, bytes.length);
+        try (OutputStream output = exchange.getResponseBody()) {
+            output.write(bytes);
+        }
+    }
+
+    private static String renderGenerationProgress() {
+        return """
+            <section id='generation-progress' aria-labelledby='generation-title' hidden>
+              <h2 id='generation-title'>生成の進捗</h2>
+              <p id='generation-period'></p>
+              <progress id='generation-bar' max='100' value='0' aria-label='生成進捗' style='width:100%;height:24px'></progress>
+              <p><strong id='generation-percent'>0%</strong> <span id='generation-days'></span></p>
+              <p id='generation-message' role='status' aria-live='polite'></p>
+              <p id='generation-connection' role='status'></p>
+              <p>進捗率は処理済みの時間枠を基準にしています。最後の勤務時間調整まで完了すると100%になります。</p>
+              <p id='generation-result' hidden><a class='primary-link' href='/shifts'>シフト結果を見る</a></p>
+            </section>
+            <noscript><p>進捗の自動更新にはJavaScriptが必要です。</p></noscript>
+            <script>
+            (() => {
+              const form = document.querySelector('.generate-form');
+              const panel = document.getElementById('generation-progress');
+              const message = document.getElementById('generation-message');
+              const connection = document.getElementById('generation-connection');
+              function render(s) {
+                panel.hidden = s.state === 'IDLE';
+                const running = s.state === 'RUNNING';
+                form.querySelectorAll('input,button').forEach(el => el.disabled = running);
+                document.getElementById('generation-period').textContent = s.start + ' 〜 ' + s.end;
+                document.getElementById('generation-bar').value = s.percent;
+                document.getElementById('generation-percent').textContent = s.percent + '%';
+                document.getElementById('generation-days').textContent = s.completedDays + ' / ' + s.totalDays + '日分の配置処理済み';
+                document.getElementById('generation-result').hidden = s.state !== 'SUCCEEDED';
+                message.className = s.state === 'FAILED' ? 'error' : '';
+                if (s.state === 'SUCCEEDED') message.textContent = 'シフト生成が完了しました。';
+                else if (s.state === 'FAILED') message.textContent = 'エラーが発生しました。シフト生成を完了できませんでした。一部だけ作成されている可能性があります。原因を確認してから対象期間を再生成してください。';
+                else if (s.stage === 'PREPARING') message.textContent = '生成を準備しています…';
+                else if (s.stage === 'ADJUSTING') message.textContent = '配置処理が終わりました。勤務時間を最終調整しています…';
+                else message.textContent = s.date + ' ' + s.time + ' の配置を処理中…';
+              }
+              form.addEventListener('submit', event => {
+                if (event.defaultPrevented) return;
+                form.querySelector('button[type=submit]').disabled = true;
+              });
+              async function poll() {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 10000);
+                try {
+                  const response = await fetch('/generate-status', {cache:'no-store', signal:controller.signal});
+                  if (response.redirected) {
+                    panel.hidden = false;
+                    connection.textContent = 'ログインの有効期限が切れました。再ログインして進捗を確認してください。';
+                    return;
+                  }
+                  if (!response.ok) throw new Error('status');
+                  render(await response.json());
+                  connection.textContent = '';
+                } catch (error) {
+                  panel.hidden = false;
+                  connection.textContent = '進捗を取得できませんでした。自動で再接続します。生成状況を確認するまで再実行はお待ちください。';
+                } finally {
+                  clearTimeout(timeout);
+                }
+                setTimeout(poll, 1500);
+              }
+            """
+            + "render(" + GENERATION.snapshot().toJson() + ");poll();})();</script>";
     }
 
     private static String renderEmployees(HttpExchange exchange) throws Exception {
@@ -1455,11 +1552,38 @@ public class WebServer {
         return time.plusMinutes(30);
     }
 
-    private static String renderRequests() throws Exception {
+    private static String renderRequests(HttpExchange exchange) throws Exception {
+        Map<String, String> params = getParams(exchange);
+        DateRange period = getInputPeriod();
+        boolean invalid = false;
+        if (params.containsKey("period_start") || params.containsKey("period_end")) {
+            try {
+                period = parseRequestPeriod(params);
+            } catch (IllegalArgumentException e) {
+                invalid = true;
+            }
+        }
         StringBuilder html = new StringBuilder();
+        if (invalid) {
+            html.append("<p class='error'>期間は開始日から1〜62日以内で指定してください。</p>");
+        }
+        html.append("<form class='filter-form' method='get' action='/requests'>");
+        html.append("<label>開始日<input type='date' name='period_start' required value='")
+            .append(period.start).append("'></label>");
+        html.append("<label>終了日<input type='date' name='period_end' required value='")
+            .append(period.end).append("'></label>");
+        html.append("<button type='submit'>表示</button></form>");
+        long days = java.time.temporal.ChronoUnit.DAYS.between(period.start, period.end) + 1;
+        html.append("<p><a href='/requests?period_start=").append(period.start.minusDays(days))
+            .append("&amp;period_end=").append(period.end.minusDays(days)).append("'>前の期間</a> / ");
+        html.append("<a href='/requests?period_start=").append(period.start.plusDays(days))
+            .append("&amp;period_end=").append(period.end.plusDays(days)).append("'>次の期間</a></p>");
+        html.append("<p>表示期間：").append(period.start).append(" 〜 ").append(period.end).append("</p>");
 
         html.append("<h1>希望一覧</h1>");
-        html.append("<p><a class='primary-link' href='/request-form'>希望を入力する</a></p>");
+        html.append("<p><a class='primary-link' href='/request-form?period_start=")
+            .append(period.start).append("&amp;period_end=").append(period.end)
+            .append("'>希望を入力する</a></p>");
         html.append("<table>");
         html.append("<tr><th>日付</th><th>曜日</th><th>名前</th><th>区分</th><th>希望時間</th></tr>");
 
@@ -1467,14 +1591,19 @@ public class WebServer {
             "SELECT r.work_date, e.name, e.employment_type, r.start_time, r.end_time " +
             "FROM request_shift r " +
             "JOIN employees e ON r.employee_id = e.employee_id " +
+            "WHERE r.work_date BETWEEN ? AND ? " +
             "ORDER BY r.work_date, r.start_time, e.employee_id";
 
         try (
             Connection connection = DBConnection.getConnection();
-            PreparedStatement statement = connection.prepareStatement(sql);
-            ResultSet rs = statement.executeQuery()
+            PreparedStatement statement = connection.prepareStatement(sql)
         ) {
+            statement.setDate(1, Date.valueOf(period.start));
+            statement.setDate(2, Date.valueOf(period.end));
+            try (ResultSet rs = statement.executeQuery()) {
+            boolean found = false;
             while (rs.next()) {
+                found = true;
                 LocalDate date = rs.getDate("work_date").toLocalDate();
 
                 html.append("<tr>");
@@ -1485,6 +1614,10 @@ public class WebServer {
                 html.append("<td>").append(formatTimeRange(rs.getTime("start_time").toLocalTime(), rs.getTime("end_time").toLocalTime())).append("</td>");
                 html.append("</tr>");
             }
+            if (!found) {
+                html.append("<tr><td colspan='5'>この期間の希望はまだ登録されていません。</td></tr>");
+            }
+            }
         }
 
         html.append("</table>");
@@ -1494,7 +1627,7 @@ public class WebServer {
     private static String renderRequestForm(HttpExchange exchange) throws Exception {
         Map<String, String> params = getParams(exchange);
 
-        DateRange period = getConfiguredPeriod();
+        DateRange period = getInputPeriod();
         boolean invalidPeriod = false;
         if (params.containsKey("period_start") || params.containsKey("period_end")) {
             try {
@@ -1527,6 +1660,11 @@ public class WebServer {
         StringBuilder html = new StringBuilder();
 
         html.append("<h1>希望入力</h1>");
+        if ("saved".equals(params.get("result"))) {
+            html.append("<p class='success' role='status'>希望を登録しました。続けて入力できます。</p>");
+        }
+        html.append("<p><a href='/requests?period_start=").append(periodStart)
+            .append("&amp;period_end=").append(periodEnd).append("'>この期間の希望一覧を見る</a></p>");
         if (invalidPeriod || "invalid".equals(params.get("result"))) {
             html.append("<p class='error'>開始日と終了日を確認してください。期間は最大62日です。</p>");
         }
@@ -1549,6 +1687,7 @@ public class WebServer {
             .append(periodStart).append("'></label>");
         html.append("<label>終了日<input type='date' name='period_end' required value='")
             .append(periodEnd).append("'></label>");
+        appendMonthShortcuts(html, "period_start", "period_end");
         html.append("<button type='submit'>表示</button>");
         html.append("</form>");
 
@@ -1565,6 +1704,23 @@ public class WebServer {
         html.append("<div class='total-box'>合計 <span id='totalHours'>0:00</span></div>");
         html.append("</div>");
 
+        html.append("<fieldset class='panel'><legend>まとめて入力</legend>");
+        html.append("<label>対象 <select id='bulk-day'><option value='all'>全日</option>");
+        String[] weekdays = {"月", "火", "水", "木", "金", "土", "日"};
+        for (int day = 1; day <= 7; day++) {
+            html.append("<option value='").append(day).append("'>").append(weekdays[day - 1]).append("曜日</option>");
+        }
+        html.append("</select></label> ");
+        html.append("<label>希望 <select id='bulk-mode'><option value='time'>時間指定</option>")
+            .append("<option value='all'>終日OK</option><option value='off'>休み</option></select></label> ");
+        html.append("<label>開始 <select id='bulk-start'>");
+        appendTimeOptions(html, "10:00");
+        html.append("</select></label> <label>終了 <select id='bulk-end'>");
+        appendTimeOptions(html, "13:00");
+        html.append("</select></label> <button type='button' onclick='applyBulk()'>反映する</button> ");
+        html.append("<button type='button' id='bulk-undo' onclick='undoBulk()' disabled>直前の一括入力を戻す</button>");
+        html.append("<p>対象の日の入力内容を置き換えます。確認してから「提出する」を押してください。</p>");
+        html.append("<p id='bulk-status' role='status'></p></fieldset>");
         html.append("<div class='request-days'>");
 
         for (int i = 0; i < periodDays; i++) {
@@ -1586,7 +1742,7 @@ public class WebServer {
                 }
             }
 
-            html.append("<section class='request-day'>");
+            html.append("<section class='request-day' data-weekday='").append(date.getDayOfWeek().getValue()).append("'>");
             html.append("<div class='request-date'>");
             html.append("<strong>").append(date.toString().replace("-", "/")).append("（").append(dayOfWeek(date)).append("）</strong>");
             html.append("</div>");
@@ -1640,6 +1796,15 @@ public class WebServer {
         html.append("</form>");
 
         html.append("<script>");
+        html.append("var bulkUndo=null;");
+        html.append("function readDay(row){return {mode:row.querySelector('input:checked').value,start:row.querySelector('select[name^=start_]').value,end:row.querySelector('select[name^=end_]').value};}");
+        html.append("function writeDay(row,v){row.querySelectorAll('input[type=radio]').forEach(function(r){r.checked=r.value===v.mode;});row.querySelector('select[name^=start_]').value=v.start;row.querySelector('select[name^=end_]').value=v.end;}");
+        html.append("function applyBulk(){var day=document.getElementById('bulk-day').value;var v={mode:document.getElementById('bulk-mode').value,start:document.getElementById('bulk-start').value,end:document.getElementById('bulk-end').value};");
+        html.append("if(v.mode==='time'&&toMinutes(v.start)>=toMinutes(v.end)){document.getElementById('bulk-status').textContent='終了時刻は開始時刻より後にしてください。';return;}");
+        html.append("bulkUndo=[];document.querySelectorAll('.request-day').forEach(function(row){if(day==='all'||row.dataset.weekday===day){bulkUndo.push({row:row,value:readDay(row)});writeDay(row,v);}});");
+        html.append("document.getElementById('bulk-undo').disabled=bulkUndo.length===0;document.getElementById('bulk-status').textContent=bulkUndo.length+'日分を反映しました。提出するまで保存されません。';updateTotal();}");
+        html.append("function undoBulk(){if(!bulkUndo)return;bulkUndo.forEach(function(v){writeDay(v.row,v.value);});bulkUndo=null;document.getElementById('bulk-undo').disabled=true;document.getElementById('bulk-status').textContent='一括入力前の内容に戻しました。';updateTotal();}");
+        html.append("document.querySelector('.request-submit-form').addEventListener('submit',function(event){var bad=Array.from(document.querySelectorAll('.request-day')).find(function(row){var v=readDay(row);return v.mode==='time'&&toMinutes(v.start)>=toMinutes(v.end);});if(bad){event.preventDefault();alert('終了時刻は開始時刻より後にしてください。');bad.querySelector('select').focus();}});");
         html.append("function toMinutes(v){var p=v.split(':');return Number(p[0])*60+Number(p[1]);}");
         html.append("function updateTotal(){");
         html.append("var total=0;");
@@ -1756,7 +1921,8 @@ public class WebServer {
             connection.commit();
         }
 
-        redirect(exchange, "/requests");
+        redirect(exchange, "/request-form?result=saved&employee_id=" + employeeId
+            + "&period_start=" + periodStart + "&period_end=" + periodEnd);
     }
 
     private static String renderShifts() throws Exception {
@@ -1801,6 +1967,14 @@ public class WebServer {
 
         for (ShiftBlock block : blocks) {
             byEmployee.computeIfAbsent(block.name, key -> new ArrayList<>()).add(block);
+        }
+
+        // CSS Grid auto-placement can create extra rows for out-of-order columns,
+        // even when the intervals do not overlap. Keep rendering independent of query order.
+        for (List<ShiftBlock> employeeBlocks : byEmployee.values()) {
+            employeeBlocks.sort(java.util.Comparator
+                .comparing((ShiftBlock block) -> block.startTime)
+                .thenComparing(block -> block.endTime));
         }
 
         html.append("<section class='shift-card'>");
@@ -2281,10 +2455,37 @@ public class WebServer {
         return getConfiguredPeriod().start;
     }
 
+    private static void appendMonthShortcuts(StringBuilder html, String startName, String endName) {
+        LocalDate today = LocalDate.now(java.time.ZoneId.of("Asia/Tokyo"));
+        for (int offset = 0; offset <= 1; offset++) {
+            DateRange month = currentMonth(today.plusMonths(offset));
+            html.append("<button type='button' onclick=\"this.form.elements['")
+                .append(startName).append("'].value='").append(month.start)
+                .append("';this.form.elements['").append(endName).append("'].value='")
+                .append(month.end).append("';\">").append(offset == 0 ? "今月" : "来月").append("</button>");
+        }
+    }
+
+    private static DateRange currentMonth(LocalDate today) {
+        return new DateRange(today.withDayOfMonth(1), today.withDayOfMonth(today.lengthOfMonth()));
+    }
+
+    private static DateRange inputPeriod(DateRange configured, LocalDate today) {
+        long days = java.time.temporal.ChronoUnit.DAYS.between(configured.start, configured.end) + 1;
+        if (configured.end.isBefore(today) || days < 1 || days > 62) {
+            return currentMonth(today);
+        }
+        return configured;
+    }
+
+    private static DateRange getInputPeriod() throws Exception {
+        return inputPeriod(getConfiguredPeriod(), LocalDate.now(java.time.ZoneId.of("Asia/Tokyo")));
+    }
+
     private static DateRange getConfiguredPeriod() throws Exception {
-        LocalDate fallbackStart = getRequestStartDate();
-        LocalDate start = fallbackStart;
-        LocalDate end = fallbackStart.plusDays(14);
+        DateRange fallback = currentMonth(LocalDate.now(java.time.ZoneId.of("Asia/Tokyo")));
+        LocalDate start = fallback.start;
+        LocalDate end = fallback.end;
         String sql =
             "SELECT setting_key, setting_value FROM app_settings " +
             "WHERE setting_key IN ('shift_start_date', 'shift_end_date')";

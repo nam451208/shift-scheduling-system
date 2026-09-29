@@ -10,6 +10,11 @@ import java.time.LocalTime;
 
 public class ShiftGenerator {
 
+    public enum Stage { PREPARING, GENERATING, ADJUSTING }
+
+    public record Progress(Stage stage, int completedSlots, int totalSlots,
+                           LocalDate date, LocalTime time) { }
+
     private static final LocalTime OPEN_TIME = LocalTime.of(10, 0);
     private static final LocalTime CLOSE_TIME = LocalTime.of(22, 0);
     private static final LocalTime NEWBIE_LIMIT_TIME = LocalTime.of(21, 0);
@@ -17,7 +22,7 @@ public class ShiftGenerator {
     private static final int FULL_TIME_MIN_SLOTS = 16;
     private static final int FULL_TIME_LONG_SLOTS = 24;
     private static final int PART_TIME_MIN_SLOTS = 8;
-    private static final int NEWBIE_MIN_SLOTS = 6;
+    private static final int NEWBIE_SLOTS = 6;
 
     public static void main(String[] args) {
 
@@ -43,6 +48,11 @@ public class ShiftGenerator {
     }
 
     public static void generateShift(LocalDate startDate, LocalDate endDate) throws Exception {
+        generateShift(startDate, endDate, progress -> { });
+    }
+
+    public static void generateShift(LocalDate startDate, LocalDate endDate,
+        java.util.function.Consumer<Progress> progress) throws Exception {
 
         if (startDate == null || endDate == null || endDate.isBefore(startDate)) {
             throw new IllegalArgumentException("シフト期間が正しくありません。");
@@ -53,6 +63,9 @@ public class ShiftGenerator {
             endDate.plusDays(1).atStartOfDay()
         ).toDays();
         int completedDays = 0;
+        int completedSlots = 0;
+        int totalSlots = totalDays * 24;
+        progress.accept(new Progress(Stage.PREPARING, 0, totalSlots, null, null));
 
         System.out.println("シフト生成を開始します: " + startDate + " 〜 " + endDate
             + "（" + totalDays + "日間）");
@@ -70,9 +83,12 @@ public class ShiftGenerator {
 
                 LocalTime timeSlot = OPEN_TIME;
                 while (timeSlot.isBefore(CLOSE_TIME)) {
+                    progress.accept(new Progress(Stage.GENERATING, completedSlots, totalSlots, workDate, timeSlot));
                     createShift(connection, workDate, timeSlot, startDate, endDate);
                     enforceBusinessRule(connection, workDate, timeSlot, startDate, endDate);
+                    completedSlots++;
                     timeSlot = addThirtyMinutes(timeSlot);
+                    progress.accept(new Progress(Stage.GENERATING, completedSlots, totalSlots, workDate, timeSlot));
                 }
 
                 completedDays++;
@@ -86,6 +102,7 @@ public class ShiftGenerator {
 
         System.out.println("勤務時間の調整中...");
         System.out.flush();
+        progress.accept(new Progress(Stage.ADJUSTING, completedSlots, totalSlots, null, null));
         extendShortShifts(startDate, endDate);
 
         System.out.println("シフト自動生成が完了しました。");
@@ -182,14 +199,7 @@ public class ShiftGenerator {
                             break;
                         }
 
-                        insertShift(
-                            connection,
-                            candidate.employeeId,
-                            workDate,
-                            timeSlot,
-                            nextTime,
-                            candidate.positionId
-                        );
+                        insertCandidate(connection, candidate, workDate, timeSlot, nextTime);
 
                         assignedCount++;
                     }
@@ -230,14 +240,7 @@ public class ShiftGenerator {
                     return;
                 }
 
-                insertShift(
-                    connection,
-                    candidate.employeeId,
-                    workDate,
-                    timeSlot,
-                    addThirtyMinutes(timeSlot),
-                    candidate.positionId
-                );
+                insertCandidate(connection, candidate, workDate, timeSlot, addThirtyMinutes(timeSlot));
 
             safetyCount++;
         }
@@ -570,7 +573,7 @@ public class ShiftGenerator {
 
             candidateStmt.setInt(index++, FULL_TIME_LONG_SLOTS);
             candidateStmt.setInt(index++, FULL_TIME_MIN_SLOTS);
-            candidateStmt.setInt(index++, NEWBIE_MIN_SLOTS);
+            candidateStmt.setInt(index++, NEWBIE_SLOTS);
             candidateStmt.setInt(index++, PART_TIME_MIN_SLOTS);
 
             try (ResultSet resultSet = candidateStmt.executeQuery()) {
@@ -589,7 +592,7 @@ public class ShiftGenerator {
                     candidate.requestEndTime = resultSet.getTime("request_end_time").toLocalTime();
 
                     if (canAssignCandidate(
-                        candidate,
+                        connection, workDate, candidate,
                         timeSlot,
                         nextTime
                     )) {
@@ -767,7 +770,7 @@ public class ShiftGenerator {
                     alternative.requestEndTime = resultSet.getTime("request_end_time").toLocalTime();
 
                     if (canAssignCandidate(
-                        alternative,
+                        connection, workDate, alternative,
                         timeSlot,
                         nextTime
                     )) {
@@ -781,10 +784,12 @@ public class ShiftGenerator {
     }
 
     private static boolean canAssignCandidate(
+        Connection connection,
+        LocalDate workDate,
         Candidate candidate,
         LocalTime timeSlot,
         LocalTime nextTime
-    ) {
+    ) throws Exception {
 
         if ("FULL_TIME".equals(candidate.employmentType)) {
             return canAssignFullTime(candidate, nextTime);
@@ -795,7 +800,9 @@ public class ShiftGenerator {
         }
 
         if ("NEWBIE".equals(candidate.employmentType)) {
-            return canAssignNewbie(candidate, timeSlot, nextTime);
+            return canAssignNewbie(candidate, timeSlot, nextTime)
+                && isNewbieBlockAvailable(connection, candidate.employeeId, workDate,
+                    timeSlot, timeSlot.plusMinutes(NEWBIE_SLOTS * 30));
         }
 
         return true;
@@ -848,21 +855,15 @@ public class ShiftGenerator {
         LocalTime nextTime
     ) {
 
-        if (!timeSlot.isBefore(NEWBIE_LIMIT_TIME)) {
+        // Newbies are assigned one complete, consecutive three-hour block per day.
+        if (candidate.dailyWorkCount != 0 || candidate.requestSlots < NEWBIE_SLOTS) {
             return false;
         }
-
         LocalTime limitTime = minTime(candidate.requestEndTime, NEWBIE_LIMIT_TIME);
+        return !timeSlot.isBefore(OPEN_TIME)
+            && nextTime.equals(timeSlot.plusMinutes(30))
+            && Duration.between(timeSlot, limitTime).toMinutes() >= NEWBIE_SLOTS * 30;
 
-        int requiredSlots = Math.min(NEWBIE_MIN_SLOTS, candidate.requestSlots);
-        int afterAssignSlots = candidate.dailyWorkCount + 1;
-        int remainingSlots = countSlots(nextTime, limitTime);
-
-        if (afterAssignSlots >= requiredSlots) {
-            return true;
-        }
-
-        return afterAssignSlots + remainingSlots >= requiredSlots;
     }
 
     private static SlotStatus getSlotStatus(
@@ -939,6 +940,67 @@ public class ShiftGenerator {
         return 0;
     }
 
+    private static boolean isNewbieBlockAvailable(
+        Connection connection, int employeeId, LocalDate workDate,
+        LocalTime start, LocalTime end
+    ) throws Exception {
+        String sql = "SELECT "
+            + "(SELECT COUNT(*) FROM employee_day_off WHERE employee_id = ? AND off_date = ? "
+            + "AND (start_time IS NULL OR end_time IS NULL OR (start_time < ? AND end_time > ?))) "
+            + "+ (SELECT COUNT(*) FROM work_shift WHERE employee_id = ? AND work_date = ?) AS conflicts";
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setInt(1, employeeId);
+            statement.setDate(2, Date.valueOf(workDate));
+            statement.setTime(3, Time.valueOf(end));
+            statement.setTime(4, Time.valueOf(start));
+            statement.setInt(5, employeeId);
+            statement.setDate(6, Date.valueOf(workDate));
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next() && result.getInt("conflicts") == 0;
+            }
+        }
+    }
+
+    private static void insertCandidate(
+        Connection connection, Candidate candidate, LocalDate date,
+        LocalTime start, LocalTime next
+    ) throws Exception {
+        if (!"NEWBIE".equals(candidate.employmentType)) {
+            insertShift(connection, candidate.employeeId, date, start, next, candidate.positionId);
+            return;
+        }
+        boolean ownTransaction = connection.getAutoCommit();
+        java.sql.Savepoint savepoint = null;
+        if (ownTransaction) {
+            connection.setAutoCommit(false);
+        } else {
+            savepoint = connection.setSavepoint();
+        }
+        try {
+            for (int slot = 0; slot < NEWBIE_SLOTS; slot++) {
+                LocalTime slotStart = start.plusMinutes(slot * 30);
+                insertShift(connection, candidate.employeeId, date, slotStart,
+                    slotStart.plusMinutes(30), candidate.positionId);
+            }
+            if (ownTransaction) {
+                connection.commit();
+            } else {
+                connection.releaseSavepoint(savepoint);
+            }
+        } catch (Exception e) {
+            if (ownTransaction) {
+                connection.rollback();
+            } else {
+                connection.rollback(savepoint);
+            }
+            throw e;
+        } finally {
+            if (ownTransaction) {
+                connection.setAutoCommit(true);
+            }
+        }
+    }
+
     private static void insertShift(
         Connection connection,
         int employeeId,
@@ -975,7 +1037,7 @@ public class ShiftGenerator {
             "FROM work_shift ws " +
             "JOIN employees e ON ws.employee_id = e.employee_id " +
             "WHERE ws.work_date BETWEEN ? AND ? " +
-            "AND e.employment_type IN ('FULL_TIME', 'PART_TIME', 'NEWBIE') " +
+            "AND e.employment_type IN ('FULL_TIME', 'PART_TIME') " +
             "ORDER BY ws.work_date, ws.employee_id";
 
         try (
@@ -1010,6 +1072,10 @@ public class ShiftGenerator {
         String employmentType
     ) throws Exception {
 
+        // A newbie's complete block is reserved during selection; never extend it.
+        if ("NEWBIE".equals(employmentType)) {
+            return;
+        }
         int currentSlots = getDailyWorkSlots(connection, employeeId, workDate);
         int requestSlots = getRequestSlots(connection, employeeId, workDate);
 
@@ -1017,8 +1083,7 @@ public class ShiftGenerator {
 
         if ("FULL_TIME".equals(employmentType)) {
             requiredSlots = Math.min(FULL_TIME_MIN_SLOTS, requestSlots);
-        } else if ("NEWBIE".equals(employmentType)) {
-            requiredSlots = Math.min(NEWBIE_MIN_SLOTS, requestSlots);
+
         } else {
             requiredSlots = Math.min(PART_TIME_MIN_SLOTS, requestSlots);
         }
